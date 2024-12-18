@@ -1,3 +1,4 @@
+import datetime
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 import itertools
@@ -7,6 +8,7 @@ import argparse
 import json
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DistributedSampler, DataLoader
 import torch.multiprocessing as mp
@@ -17,21 +19,29 @@ from meldataset import MelDataset, mel_spectrogram, get_dataset_filelist
 from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator, feature_loss, generator_loss,\
     discriminator_loss
 from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint
+import tempfile
+from torch.cuda.amp import autocast, GradScaler
+
 
 torch.backends.cudnn.benchmark = True
 
 
 def train(rank, a, h):
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    accumulation_steps = 2
     if h.num_gpus > 1:
         init_process_group(backend=h.dist_config['dist_backend'], init_method=h.dist_config['dist_url'],
                            world_size=h.dist_config['world_size'] * h.num_gpus, rank=rank)
 
     torch.cuda.manual_seed(h.seed)
     device = torch.device('cuda:{:d}'.format(rank))
-
-    generator = Generator(h).to(device)
-    mpd = MultiPeriodDiscriminator().to(device)
-    msd = MultiScaleDiscriminator().to(device)
+    
+    # Modelleri oluştururken dtype'ı belirtelim
+    generator = Generator(h).to(device).to(torch.float32)
+    mpd = MultiPeriodDiscriminator().to(device).to(torch.float32)
+    msd = MultiScaleDiscriminator().to(device).to(torch.float32)
+    
+    scaler = GradScaler()  # cuda parametresini kaldırdık
 
     if rank == 0:
         print(generator)
@@ -83,6 +93,8 @@ def train(rank, a, h):
     train_loader = DataLoader(trainset, num_workers=h.num_workers, shuffle=False,
                               sampler=train_sampler,
                               batch_size=h.batch_size,
+                              persistent_workers=True,
+                            prefetch_factor=2,
                               pin_memory=True,
                               drop_last=True)
 
@@ -97,20 +109,27 @@ def train(rank, a, h):
                                        pin_memory=True,
                                        drop_last=True)
 
-        sw = SummaryWriter(os.path.join(a.checkpoint_path, 'logs'))
+        temp_log_dir = os.path.join(tempfile.gettempdir(), f'hifigan_logs_{timestamp}')
+        os.makedirs(temp_log_dir, exist_ok=True)
+        sw = SummaryWriter(temp_log_dir)
 
     generator.train()
     mpd.train()
     msd.train()
     for epoch in range(max(0, last_epoch), a.training_epochs):
         if rank == 0:
+            
             start = time.time()
             print("Epoch: {}".format(epoch+1))
+            print(f"Log directory: {temp_log_dir}")
 
         if h.num_gpus > 1:
             train_sampler.set_epoch(epoch)
 
-        for i, batch in enumerate(train_loader):
+        # tqdm ile train_loader'ı sarıyoruz
+        progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}', leave=True) if rank == 0 else train_loader
+        
+        for i, batch in enumerate(progress_bar):
             if rank == 0:
                 start_b = time.time()
             x, y, _, y_mel = batch
@@ -119,50 +138,69 @@ def train(rank, a, h):
             y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
             y = y.unsqueeze(1)
 
-            y_g_hat = generator(x)
-            y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size,
-                                          h.fmin, h.fmax_for_loss)
+            with autocast():
+                y_g_hat = generator(x)
+                y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size,
+                                            h.fmin, h.fmax_for_loss)
+
+                loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * 45
 
             optim_d.zero_grad()
 
             # MPD
-            y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat.detach())
-            loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
+            with autocast():
+                y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat.detach())
+                loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
 
-            # MSD
-            y_ds_hat_r, y_ds_hat_g, _, _ = msd(y, y_g_hat.detach())
-            loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
+                # MSD
+                y_ds_hat_r, y_ds_hat_g, _, _ = msd(y, y_g_hat.detach())
+                loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
 
-            loss_disc_all = loss_disc_s + loss_disc_f
+                loss_disc_all = loss_disc_s + loss_disc_f
 
-            loss_disc_all.backward()
-            optim_d.step()
+            scaler.scale(loss_disc_all).backward()
+            scaler.step(optim_d)
+            scaler.update()
 
             # Generator
             optim_g.zero_grad()
 
-            # L1 Mel-Spectrogram Loss
-            loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * 45
+            with autocast():
+                # L1 Mel-Spectrogram Loss
+                loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * 45
 
-            y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y, y_g_hat)
-            y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = msd(y, y_g_hat)
-            loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
-            loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
-            loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
-            loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
-            loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel
+                y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y, y_g_hat)
+                y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = msd(y, y_g_hat)
+                loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
+                loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
+                loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
+                loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
+                loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel
 
-            loss_gen_all.backward()
-            optim_g.step()
+            # Gradient accumulation
+            loss_gen_all = loss_gen_all / accumulation_steps
+            scaler.scale(loss_gen_all).backward()
+
+            if (i + 1) % accumulation_steps == 0:
+                scaler.step(optim_g)
+                scaler.update()
+                optim_g.zero_grad()
 
             if rank == 0:
+                # Progress bar'ı güncelle
+                progress_bar.set_postfix({
+                    'Gen Loss': f'{loss_gen_all.item():.3f}',
+                    'Mel Error': f'{F.l1_loss(y_mel, y_g_hat_mel).item():.3f}',
+                    's/b': f'{time.time() - start_b:.3f}'
+                })
+
                 # STDOUT logging
                 if steps % a.stdout_interval == 0:
                     with torch.no_grad():
                         mel_error = F.l1_loss(y_mel, y_g_hat_mel).item()
 
                     print('Steps : {:d}, Gen Loss Total : {:4.3f}, Mel-Spec. Error : {:4.3f}, s/b : {:4.3f}'.
-                          format(steps, loss_gen_all, mel_error, time.time() - start_b))
+                        format(steps, loss_gen_all, mel_error, time.time() - start_b))
 
                 # checkpointing
                 if steps % a.checkpoint_interval == 0 and steps != 0:
@@ -172,11 +210,11 @@ def train(rank, a, h):
                     checkpoint_path = "{}/do_{:08d}".format(a.checkpoint_path, steps)
                     save_checkpoint(checkpoint_path, 
                                     {'mpd': (mpd.module if h.num_gpus > 1
-                                                         else mpd).state_dict(),
-                                     'msd': (msd.module if h.num_gpus > 1
-                                                         else msd).state_dict(),
-                                     'optim_g': optim_g.state_dict(), 'optim_d': optim_d.state_dict(), 'steps': steps,
-                                     'epoch': epoch})
+                                                        else mpd).state_dict(),
+                                    'msd': (msd.module if h.num_gpus > 1
+                                                        else msd).state_dict(),
+                                    'optim_g': optim_g.state_dict(), 'optim_d': optim_d.state_dict(), 'steps': steps,
+                                    'epoch': epoch})
 
                 # Tensorboard summary logging
                 if steps % a.summary_interval == 0:
@@ -189,13 +227,13 @@ def train(rank, a, h):
                     torch.cuda.empty_cache()
                     val_err_tot = 0
                     with torch.no_grad():
-                        for j, batch in enumerate(validation_loader):
+                        for j, batch in enumerate(tqdm(validation_loader, desc="Validation", leave=False)):
                             x, y, _, y_mel = batch
                             y_g_hat = generator(x.to(device))
                             y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
                             y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate,
-                                                          h.hop_size, h.win_size,
-                                                          h.fmin, h.fmax_for_loss)
+                                                        h.hop_size, h.win_size,
+                                                        h.fmin, h.fmax_for_loss)
                             val_err_tot += F.l1_loss(y_mel, y_g_hat_mel).item()
 
                             if j <= 4:
@@ -205,10 +243,10 @@ def train(rank, a, h):
 
                                 sw.add_audio('generated/y_hat_{}'.format(j), y_g_hat[0], steps, h.sampling_rate)
                                 y_hat_spec = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels,
-                                                             h.sampling_rate, h.hop_size, h.win_size,
-                                                             h.fmin, h.fmax)
+                                                            h.sampling_rate, h.hop_size, h.win_size,
+                                                            h.fmin, h.fmax)
                                 sw.add_figure('generated/y_hat_spec_{}'.format(j),
-                                              plot_spectrogram(y_hat_spec.squeeze(0).cpu().numpy()), steps)
+                                            plot_spectrogram(y_hat_spec.squeeze(0).cpu().numpy()), steps)
 
                         val_err = val_err_tot / (j+1)
                         sw.add_scalar("validation/mel_spec_error", val_err, steps)

@@ -2,6 +2,8 @@ import glob
 import os
 import matplotlib
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.utils import weight_norm
 matplotlib.use("Agg")
 import matplotlib.pylab as plt
@@ -34,7 +36,6 @@ def apply_weight_norm(m):
 def get_padding(kernel_size, dilation=1):
     return int((kernel_size*dilation - dilation)/2)
 
-
 def load_checkpoint(filepath, device):
     assert os.path.isfile(filepath)
     print("Loading '{}'".format(filepath))
@@ -55,4 +56,5 @@ def scan_checkpoint(cp_dir, prefix):
     if len(cp_list) == 0:
         return None
     return sorted(cp_list)[-1]
+
 

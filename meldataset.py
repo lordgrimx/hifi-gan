@@ -6,12 +6,16 @@ import torch.utils.data
 import numpy as np
 from librosa.util import normalize
 from scipy.io.wavfile import read
-from librosa.filters import mel as librosa_mel_fn
+from librosa.filters import mel as librosa_mel
 
 MAX_WAV_VALUE = 32768.0
 
 
 def load_wav(full_path):
+    # Forward slash'ları backward slash'a çevir
+    full_path = full_path.replace('/', '\\')
+    if not full_path.endswith('.wav'):
+        full_path = full_path + '.wav'
     sampling_rate, data = read(full_path)
     return data, sampling_rate
 
@@ -52,21 +56,30 @@ def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin,
     if torch.max(y) > 1.:
         print('max value is ', torch.max(y))
 
-    global mel_basis, hann_window
-    if fmax not in mel_basis:
-        mel = librosa_mel_fn(sampling_rate, n_fft, num_mels, fmin, fmax)
-        mel_basis[str(fmax)+'_'+str(y.device)] = torch.from_numpy(mel).float().to(y.device)
-        hann_window[str(y.device)] = torch.hann_window(win_size).to(y.device)
+    mel_basis = librosa_mel(
+        sr=sampling_rate,
+        n_fft=n_fft,
+        n_mels=num_mels,
+        fmin=fmin,
+        fmax=fmax
+    )
+    mel_basis = torch.from_numpy(mel_basis).float().to(y.device)
+    hann_window = torch.hann_window(win_size).to(y.device)
 
-    y = torch.nn.functional.pad(y.unsqueeze(1), (int((n_fft-hop_size)/2), int((n_fft-hop_size)/2)), mode='reflect')
+    y = torch.nn.functional.pad(y.unsqueeze(1),
+                              (int((n_fft-hop_size)/2), int((n_fft-hop_size)/2)),
+                              mode='reflect')
     y = y.squeeze(1)
 
-    spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window[str(y.device)],
-                      center=center, pad_mode='reflect', normalized=False, onesided=True)
+    # STFT uyarısını gidermek için return_complex=True kullanıyoruz
+    spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size,
+                     window=hann_window, center=center, pad_mode='reflect',
+                     normalized=False, onesided=True, return_complex=True)
+    
+    # Complex değeri magnitude'a çevir
+    spec = torch.abs(spec)
 
-    spec = torch.sqrt(spec.pow(2).sum(-1)+(1e-9))
-
-    spec = torch.matmul(mel_basis[str(fmax)+'_'+str(y.device)], spec)
+    spec = torch.matmul(mel_basis, spec)
     spec = spectral_normalize_torch(spec)
 
     return spec
@@ -74,11 +87,11 @@ def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin,
 
 def get_dataset_filelist(a):
     with open(a.input_training_file, 'r', encoding='utf-8') as fi:
-        training_files = [os.path.join(a.input_wavs_dir, x.split('|')[0] + '.wav')
+        training_files = [os.path.join(a.input_wavs_dir, x.split('|')[0])
                           for x in fi.read().split('\n') if len(x) > 0]
 
     with open(a.input_validation_file, 'r', encoding='utf-8') as fi:
-        validation_files = [os.path.join(a.input_wavs_dir, x.split('|')[0] + '.wav')
+        validation_files = [os.path.join(a.input_wavs_dir, x.split('|')[0])
                             for x in fi.read().split('\n') if len(x) > 0]
     return training_files, validation_files
 
@@ -88,6 +101,11 @@ class MelDataset(torch.utils.data.Dataset):
                  hop_size, win_size, sampling_rate,  fmin, fmax, split=True, shuffle=True, n_cache_reuse=1,
                  device=None, fmax_loss=None, fine_tuning=False, base_mels_path=None):
         self.audio_files = training_files
+        if isinstance(self.audio_files[0], tuple):
+            self.audio_files = [(wav.replace('/', '\\'), mel.replace('/', '\\')) 
+                               for wav, mel in self.audio_files]
+        else:
+            self.audio_files = [f.replace('/', '\\') for f in self.audio_files]
         random.seed(1234)
         if shuffle:
             random.shuffle(self.audio_files)
@@ -107,9 +125,13 @@ class MelDataset(torch.utils.data.Dataset):
         self.device = device
         self.fine_tuning = fine_tuning
         self.base_mels_path = base_mels_path
-
+        
     def __getitem__(self, index):
         filename = self.audio_files[index]
+        if isinstance(filename, tuple):
+            filename = filename[0]
+        filename = filename.replace('/', '\\')
+        audio, sampling_rate = load_wav(filename)
         if self._cache_ref_count == 0:
             audio, sampling_rate = load_wav(filename)
             audio = audio / MAX_WAV_VALUE
@@ -141,7 +163,7 @@ class MelDataset(torch.utils.data.Dataset):
                                   center=False)
         else:
             mel = np.load(
-                os.path.join(self.base_mels_path, os.path.splitext(os.path.split(filename)[-1])[0] + '.npy'))
+                os.path.join(self.base_mels_path, os.path.splitext(os.path.split(filename)[-1])[0]))
             mel = torch.from_numpy(mel)
 
             if len(mel.shape) < 3:
